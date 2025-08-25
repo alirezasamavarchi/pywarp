@@ -830,8 +830,12 @@ class WarpStatusHandler(QThread):
         match = re.search(r"Reason:\s*(.*)", status)
         if match:
             reason_text = match.group(1).strip()
-            return 'No Network' if 'No Network' in reason_text else reason_text
-        return "Failed"
+        if 'No Network' in reason_text:
+            return 'No Network'
+        elif 'WARP-on-WARP' in reason_text:
+            return 'Connected'  # Treat WARP-on-WARP as Connected
+        return reason_text
+    return "Failed"
 
 
 class WarpStatsHandler(QThread):
@@ -1248,6 +1252,30 @@ class AdvancedSettings(QDialog):
         endpoint_layout.addWidget(self.endpoint_reset_button)
         endpoint_group.setLayout(endpoint_layout)
 
+        # WARP-on-WARP Endpoint
+        warp_on_warp_group = QGroupBox(self.tr("WARP-on-WARP Endpoint"))
+        warp_on_warp_layout = QHBoxLayout()
+
+        self.warp_on_warp_input = QComboBox()
+        self.warp_on_warp_input.setEditable(True)
+        self.warp_on_warp_input.setInsertPolicy(QComboBox.InsertAtTop)
+        self.warp_on_warp_input.setMinimumWidth(250)
+
+        self.load_warp_on_warp_history()
+        self.warp_on_warp_input.setPlaceholderText(self.tr("Set WARP-on-WARP Endpoint"))
+        self.warp_on_warp_input.setCurrentText(self.current_warp_on_warp_endpoint)
+
+        self.warp_on_warp_save_button = QPushButton(self.tr("Save"))
+        self.warp_on_warp_save_button.clicked.connect(self.save_warp_on_warp_endpoint)
+
+        self.warp_on_warp_reset_button = QPushButton(self.tr("Reset"))
+        self.warp_on_warp_reset_button.clicked.connect(self.reset_warp_on_warp_endpoint)
+
+        warp_on_warp_layout.addWidget(self.warp_on_warp_input)
+        warp_on_warp_layout.addWidget(self.warp_on_warp_save_button)
+        warp_on_warp_layout.addWidget(self.warp_on_warp_reset_button)
+        warp_on_warp_group.setLayout(warp_on_warp_layout)
+        
         # Coming Soon
         coming_soon_group = QGroupBox(self.tr("App Excludes"))
         coming_soon_layout = QVBoxLayout()
@@ -1260,6 +1288,65 @@ class AdvancedSettings(QDialog):
         layout.addWidget(coming_soon_group)
         self.setLayout(layout)
         self.update_list_view()
+
+    def load_warp_on_warp_history(self):
+        history = self.settings_handler.get("warp_on_warp_endpoint_history", [])
+        if isinstance(history, str):
+            try:
+                import ast
+                history = ast.literal_eval(history)
+            except Exception:
+                history = []
+        if not isinstance(history, list):
+            history = []
+
+        if history:
+            self.warp_on_warp_input.addItems(history)
+        if self.current_warp_on_warp_endpoint and self.current_warp_on_warp_endpoint not in history:
+            self.warp_on_warp_input.insertItem(0, self.current_warp_on_warp_endpoint)
+
+    def save_warp_on_warp_history(self, endpoint):
+        history = self.settings_handler.get("warp_on_warp_endpoint_history", [])
+        if not isinstance(history, list):
+            history = []
+
+        if endpoint in history:
+            history.remove(endpoint)
+        history.insert(0, endpoint)
+        history = history[:5]
+
+        self.settings_handler.save_settings("warp_on_warp_endpoint_history", history)
+        self.warp_on_warp_input.clear()
+        self.warp_on_warp_input.addItems(history)
+        self.warp_on_warp_input.setCurrentText(endpoint)
+
+    def save_warp_on_warp_endpoint(self):
+        endpoint = self.warp_on_warp_input.currentText().strip()
+        if not endpoint:
+            return
+
+        try:
+            result = run_warp_command("warp-cli", "tunnel", "endpoint", "set", endpoint)
+
+            if result.returncode != 0:
+                error_line = result.stderr.strip().split("\n")[0]
+                QMessageBox.warning(self, self.tr("Error"), error_line)
+                return
+
+            self.settings_handler.save_settings("warp_on_warp_endpoint", endpoint)
+            self.save_warp_on_warp_history(endpoint)
+            QMessageBox.information(self, self.tr("Saved"), self.tr("WARP-on-WARP endpoint saved successfully."))
+        except Exception as e:
+            QMessageBox.warning(self, self.tr("Error"), self.tr("An exception occurred: {}").format(str(e)))
+
+    def reset_warp_on_warp_endpoint(self):
+        try:
+            run_warp_command("warp-cli", "tunnel", "endpoint", "reset")
+            self.settings_handler.save_settings("warp_on_warp_endpoint", "")
+            self.warp_on_warp_input.clear()
+            QMessageBox.information(self, self.tr("Reset"), self.tr("WARP-on-WARP endpoint reset successfully."))
+        except Exception as e:
+            QMessageBox.warning(self, self.tr("Error"), self.tr("Reset failed: {}").format(e))
 
     def open_exclusion_manager(self):
         exclusion_manager = ExclusionManager(self)
@@ -1552,7 +1639,8 @@ class SettingsPage(QWidget):
             "dot": self.tr("Only DNS over TLS (DoT). Secure DNS, no VPN tunnel."),
             "warp+dot": self.tr("VPN tunnel + DNS over TLS. Full encryption + secure DNS."),
             "proxy": self.tr("Sets up a local proxy (manual port needed). Apps can use it via localhost."),
-            "tunnel_only": self.tr("Tunnel is created but not used unless manually routed.")
+            "tunnel_only": self.tr("Tunnel is created but not used unless manually routed."),
+            "warp_on_warp": self.tr("Routes WARP traffic through another WARP instance for enhanced privacy.")
         }
         for mode, tooltip in modes_with_tooltips.items():
             self.modes_dropdown.addItem(mode)
@@ -1738,7 +1826,62 @@ class SettingsPage(QWidget):
                 logger.error(f"Failed to set proxy port: {e}")
                 self.modes_dropdown.setCurrentText(self.current_mode)
                 return
+        elif selected_mode == "warp_on_warp":
+        # Prompt for WARP-on-WARP endpoint if needed
+        endpoint, ok = QInputDialog.getText(
+            self,
+            self.tr("WARP-on-WARP Endpoint"),
+            self.tr("Enter the remote WARP endpoint (e.g., engage.cloudflareclient.com:2408):"),
+            text=self.settings_handler.get("warp_on_warp_endpoint", "")
+        )
+        if not ok:
+            self.modes_dropdown.setCurrentText(self.current_mode)
+            return
+            try:
+            # Set WARP-on-WARP mode
+            cmd = run_warp_command("warp-cli", "mode", "warp")
+            if cmd.returncode != 0:
+                QMessageBox.warning(
+                    self, self.tr("Error"),
+                    self.tr("Failed to set base WARP mode:\n{}").format(cmd.stderr.strip())
+                )
+                logger.error(f"Failed to set base WARP mode: {cmd.stderr.strip()}")
+                self.modes_dropdown.setCurrentText(self.current_mode)
+                return
 
+            # Configure WARP-on-WARP endpoint
+            if endpoint:
+                endpoint_cmd = run_warp_command("warp-cli", "tunnel", "endpoint", "set", endpoint)
+                if endpoint_cmd.returncode != 0:
+                    QMessageBox.warning(
+                        self, self.tr("Error"),
+                        self.tr("Failed to set WARP-on-WARP endpoint:\n{}").format(endpoint_cmd.stderr.strip())
+                    )
+                    logger.error(f"Failed to set WARP-on-WARP endpoint: {endpoint_cmd.stderr.strip()}")
+                    self.modes_dropdown.setCurrentText(self.current_mode)
+                    return
+                self.settings_handler.save_settings("warp_on_warp_endpoint", endpoint)
+
+            self.current_mode = selected_mode
+            self.settings_handler.save_settings("mode", selected_mode)
+            main_window = self.window()
+            if isinstance(main_window, MainWindow):
+                for action in main_window.modes_group.actions():
+                    if action.text() == selected_mode:
+                        action.setChecked(True)
+                main_window.info_label.setText(
+                    self.tr(
+                        "WARP-on-WARP active on endpoint: <span style='color: #0078D4; font-weight: bold;'>{}</span>").format(
+                        endpoint or "Default")
+                )
+                main_window.info_label.show()
+            logger.info(f"Successfully set mode to {selected_mode} with endpoint {endpoint}")
+            QMessageBox.information(self, self.tr("Mode Changed"), self.tr("Mode set to: {}").format(selected_mode))
+        except Exception as e:
+            QMessageBox.warning(self, self.tr("Error"), self.tr("Command failed: {}").format(e))
+            self.modes_dropdown.setCurrentText(self.current_mode)
+            return
+    else:
         try:
             cmd = run_warp_command("warp-cli", "mode", selected_mode)
             if cmd.returncode == 0:
@@ -1965,7 +2108,7 @@ class MainWindow(QMainWindow):
                     "<li><b>Endpoint:</b> Set a custom endpoint for advanced configurations.</li>"
                     "<li><b>Protocol:</b> Choose your connection protocol.</li>"
                     "</ul>"
-                    "<p><b>⚠️ Important Warning:</b> Disconnect Warp before changing DNS mode or custom endpoint.</p>"))
+                    "<p><b>⚠️ Important Warning:</b> Disconnect Warp before changing DNS mode, custom endpoint, or WARP-on-WARP settings.</p>"))
         tutorials_dialog.addButton(self.tr("Close"), QMessageBox.RejectRole)
         tutorials_dialog.exec()
 
@@ -1997,7 +2140,7 @@ class MainWindow(QMainWindow):
         modes_menu = QMenu(self.tr("Set Mode"), self)
         self.modes_group = QActionGroup(self)
         self.modes_group.setExclusive(True)
-        modes_list = ["warp", "doh", "warp+doh", "dot", "warp+dot", "proxy", "tunnel_only"]
+        modes_list = ["warp", "doh", "warp+doh", "dot", "warp+dot", "proxy", "tunnel_only", "warp_on_warp"]
         current_mode = self.settings_handler.get("mode", "warp")
 
         for mode in modes_list:
@@ -2237,6 +2380,27 @@ class MainWindow(QMainWindow):
                                                       self.tr(
                                                           "Status: <span style='color: red; font-weight: bold;'>Network Error</span>")))
 
+        # Update info_label for WARP-on-WARP
+    current_mode = self.settings_handler.get("mode", "warp")
+    if current_mode == "warp_on_warp" and status == "Connected":
+        endpoint = self.settings_handler.get("warp_on_warp_endpoint", "Default")
+        self.info_label.setText(
+            self.tr(
+                "WARP-on-WARP active on endpoint: <span style='color: #0078D4; font-weight: bold;'>{}</span>").format(
+                endpoint)
+        )
+        self.info_label.show()
+    elif current_mode == "proxy" and status == "Connected":
+        port = self.settings_handler.get("proxy_port", "40000")
+        self.info_label.setText(
+            self.tr(
+                "Proxy running on 127.0.0.1:<span style='color: #0078D4; font-weight: bold;'>{}</span>").format(
+                port)
+        )
+        self.info_label.show()
+    else:
+        self.info_label.hide()
+        
         if status in ['Connected', 'Disconnected']:
             self.ip_label.setText(self.tr("IPv4: <span style='color: #0078D4; font-weight: bold;'>Receiving...</span>"))
             self.ip_fetcher_thread = QThread()
